@@ -2,7 +2,6 @@ package main
 
 import (
 	"bufio"
-	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -12,28 +11,9 @@ import (
 	"net/textproto"
 	"os"
 	"path/filepath"
+	"strconv"
 	"time"
 )
-
-func main() {
-	host := ""
-	port := "9898"
-	protocol := "tcp"
-	address := fmt.Sprintf("%s:%s", host, port)
-	server, err := net.Listen(protocol, address)
-	log.Println("application started, listening on " + address)
-	if err != nil {
-		log.Fatalf("error starting server. %v\n", err)
-	}
-	defer server.Close()
-	for {
-		conn, err := server.Accept()
-		if err != nil {
-			log.Printf("error accepting connection. %v\n", err)
-		}
-		go handleConnection(conn)
-	}
-}
 
 type entry struct {
 	Group   string    `json:"group"`
@@ -42,95 +22,96 @@ type entry struct {
 	Message string    `json:"message"`
 }
 
-func handleConnection(conn net.Conn) {
-	buffer := bytes.NewBuffer(make([]byte, 0))
-	// chunk := make([]byte, 1024)
-	processData := make(chan bool)
-	resume := make(chan bool)
-	go func(buffer *bytes.Buffer) {
-		defer conn.Close()
-		deadline := time.Now().Add(time.Duration(10) * time.Minute)
-		if err := conn.SetDeadline(deadline); err != nil {
-			log.Printf("[ERROR] failed setting read deadline. %v\n", err)
+func main() {
+	host := getenv("RLOG_HOST", "")
+	port := getenv("RLOG_PORT", "9898")
+	protocol := "tcp"
+	address := fmt.Sprintf("%s:%s", host, port)
+	server, err := net.Listen(protocol, address)
+	log.Println("application started, listening on " + address)
+
+	if err != nil {
+		log.Fatalf("error starting server. %v\n", err)
+	}
+
+	defer server.Close()
+	data := make(chan []byte, 100)
+	go useData(data)
+
+	for {
+		conn, err := server.Accept()
+		if err != nil {
+			log.Printf("error accepting connection. %v\n", err)
 		}
-		ticker := time.NewTicker(time.Duration(10) * time.Second)
-        reader := bufio.NewReader(conn)
-        tp := textproto.NewReader(reader)
-		for {
-			select {
-			case <-ticker.C:
-				processData <- true
-				select {
-				case <-resume:
-                    buffer.Reset()
-					continue
-				}
-			default:
-                line, err := tp.ReadLineBytes()
-				if err != nil && errors.Is(err, os.ErrDeadlineExceeded) {
-					log.Printf("[ERROR] timeout, closed connection. %v\n", err)
-					return
-				} else if err == io.EOF {
-                    time.Sleep(time.Duration(10) * time.Second)
-					continue
-				}
-                if len(line) == 0 {
-                    continue
-                }
-                line = append(line, byte('\n'))
-				if _, err := buffer.Write(line); err != nil {
-					log.Printf("[ERROR] failed writing chunk. %v\n", err)
-				}
-				deadline = time.Now().Add(time.Duration(10) * time.Minute)
-				if err := conn.SetDeadline(deadline); err != nil {
-					log.Printf("[ERROR] failed setting read deadline. %v\n", err)
-				}
+		go getData(conn, data)
+	}
+}
+
+func getData(conn net.Conn, data chan []byte) {
+	defer conn.Close()
+	idlCfg := getenv("RLOG_IDLE_TIMEOUT_MIN", "15")
+	idleTimeout := 15
+
+	if i, err := strconv.Atoi(idlCfg); err != nil {
+		idleTimeout = i
+	}
+
+	buf := bufio.NewReader(conn)
+	tp := textproto.NewReader(buf)
+
+	for {
+		line, err := tp.ReadLineBytes()
+		if err != nil && (errors.Is(err, io.EOF) || errors.Is(err, os.ErrDeadlineExceeded)) {
+			fmt.Printf("stop reading. %v\n", err)
+			break
+		}
+		conn.SetReadDeadline(time.Now().Add(time.Duration(idleTimeout) * time.Minute))
+		data <- line
+	}
+}
+
+func useData(data chan []byte) {
+	entryGroup := make(map[string][]byte)
+	interval := 10
+	intvlCfg := getenv("RLOG_INTERVAL_SEC", "10")
+
+	if i, err := strconv.Atoi(intvlCfg); err != nil {
+		interval = i
+	}
+
+	ticker := time.NewTicker(time.Duration(interval) * time.Second)
+
+	for {
+		select {
+		case <-ticker.C:
+			persistEntries(entryGroup)
+			ticker.Reset(time.Duration(interval) * time.Second)
+		case d := <-data:
+			var e entry
+
+			if err := json.Unmarshal(d, &e); err != nil {
+				// log error
+				continue
 			}
+
+			d = append(d, byte('\n'))
+			line := entryGroup[e.Group]
+			line = append(line, d...)
+			entryGroup[e.Group] = line
 		}
-	}(buffer)
-	scanner := bufio.NewScanner(buffer)
-	go func(scanner *bufio.Scanner) {
-		entries := make(map[string][]byte)
-		for {
-			// TODO: stop this goroutine whe client is closed
-			select {
-			case <-processData:
-				var line []byte
-				var e entry
-                count := 0
-				for scanner.Scan() {
-                    fmt.Println(count)
-                    count++
-					part := scanner.Bytes()
-                    if len(part) == 0 {
-                        continue
-                    }
-                    // fmt.Println(part)
-					if err := json.Unmarshal(part, &e); err != nil {
-						log.Printf("[ERROR] failed unmarshalling json data. %v\n", err)
-						continue
-					}
-					part = append(part, byte('\n'))
-					line = append(line, part...)
-					entries[e.Group] = line
-				}
-				if len(entries) > 0 {
-					persistEntries(entries)
-					resume <- true
-				}
-			}
-		}
-	}(scanner)
+	}
 }
 
 func persistEntries(entryGroup map[string][]byte) {
 	for group, entries := range entryGroup {
 		log.Printf("persisiting %d bytes on group %s", len(entries), group)
 		file, err := openLogFile(group)
+
 		if err != nil {
 			log.Printf("[ERROR] failed opening log file. %v\n", err)
 			continue
 		}
+
 		defer file.Close()
 		writer := bufio.NewWriter(file)
 		writer.Write(entries)
@@ -149,6 +130,7 @@ func openLogFile(group string) (*os.File, error) {
 	logDir := filepath.Join(baseDir, year, month, day)
 	logFile := filepath.Join(logDir, filename)
 	file, err := os.OpenFile(logFile, os.O_WRONLY|os.O_CREATE|os.O_APPEND, os.ModePerm)
+
 	if err == nil {
 		return file, nil
 	}
@@ -161,11 +143,18 @@ func openLogFile(group string) (*os.File, error) {
 		}
 	}
 
-	file, err = os.OpenFile(filename, os.O_APPEND|os.O_CREATE|os.O_WRONLY, os.ModePerm)
+	file, err = os.OpenFile(logFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, os.ModePerm)
 
 	if err != nil {
 		return nil, err
 	}
 
 	return file, nil
+}
+
+func getenv(key string, fallback string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return fallback
 }

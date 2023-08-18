@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
+	"sync"
 	"testing"
 	"time"
 )
@@ -39,29 +40,67 @@ func _TestReader(t *testing.T) {
 }
 
 func TestSendLogs(t *testing.T) {
-	client, err := net.Dial("tcp", "localhost:9898")
+	c1, err := net.Dial("tcp", "localhost:9898")
+
 	if err != nil {
 		t.Fatalf("error dialing server. %v\n", err)
 	}
-	defer client.Close()
-	groups := 1
-	lines := 100
+
+	defer c1.Close()
+	groups := 10
+	lines := 10000
+	wg := sync.WaitGroup{}
+
 	for i := 0; i < groups; i++ {
-		for j := 0; j < lines; j++ {
-			e := entry{
-				Group:   "group1",
-				Time:    time.Now(),
-				Level:   "INFO",
-				Message: fmt.Sprintf("Log entry number %4d", j),
+		wg.Add(1)
+		go func(group int) {
+			for j := 0; j < lines/2; j++ {
+				e := entry{
+					Group:   fmt.Sprintf("group%d", group+1),
+					Time:    time.Now(),
+					Level:   "INFO",
+					Message: fmt.Sprintf("Log entry number %4d", j),
+				}
+				bEntry, _ := json.Marshal(e)
+				bEntry = append(bEntry, byte('\n'))
+				c1.Write(bEntry)
+				time.Sleep(time.Duration(20) * time.Millisecond)
 			}
-			bEntry, err := json.Marshal(e)
-			if err != nil {
-				t.Fatalf("error marshalling log entry. %v\n", err)
+			wg.Done()
+		}(i)
+	}
+
+	c2, err := net.Dial("tcp", "localhost:9898")
+
+	if err != nil {
+		t.Fatalf("error dialing server. %v\n", err)
+	}
+
+	defer c2.Close()
+
+	for i := 0; i < groups; i++ {
+		wg.Add(1)
+		go func(group int) {
+			for j := lines / 2; j < lines; j++ {
+				e := entry{
+					Group:   fmt.Sprintf("group%d", group+1),
+					Time:    time.Now(),
+					Level:   "INFO",
+					Message: fmt.Sprintf("Log entry number %4d", j),
+				}
+				bEntry, _ := json.Marshal(e)
+				bEntry = append(bEntry, byte('\n'))
+				c2.Write(bEntry)
+				time.Sleep(time.Duration(20) * time.Millisecond)
 			}
-			bEntry = append(bEntry, byte('\n'))
-			if _, err = client.Write(bEntry); err != nil {
-				t.Fatalf("error writing log entry. %v\n", err)
-			}
-		}
+			wg.Done()
+		}(i)
+	}
+
+	wg.Wait()
+
+	select {
+	case <-time.After(5 * time.Minute):
+		fmt.Println("done!")
 	}
 }
